@@ -68,6 +68,9 @@ public class SpriteCalendar extends JFrame {
     private volatile boolean networkRunning = false;
     private ServerSocket serverSocket;
     private final List<PeerConnection> peers = new CopyOnWriteArrayList<>();
+    private static final String SHARED_DIR = "shared";
+    private final DefaultListModel<String> sharedFilesModel = new DefaultListModel<>();
+    private JList<String> sharedFilesList;
     private Thread acceptThread;
 
     public static class EventItem {
@@ -125,6 +128,30 @@ public class SpriteCalendar extends JFrame {
                         SwingUtilities.invokeLater(() -> applyRemoteState(data));
                     } else if ("PING".equals(line)) {
                         out.println("PONG");
+                    } else if ("FILELIST".equals(line)) {
+                        List<String> names = new ArrayList<>();
+                        while ((line = in.readLine()) != null && !"END".equals(line)) {
+                            if (!line.isBlank()) names.add(line.trim());
+                        }
+                        SwingUtilities.invokeLater(() -> {
+                            for (String n : names) {
+                                if (!containsFileName(n)) sharedFilesModel.addElement(n);
+                            }
+                        });
+                    } else if ("GETFILE".equals(line)) {
+                            String fileName = in.readLine();
+                            if (fileName != null) sendFileToPeer(this, fileName.trim());
+                        }
+                        else if ("FILEDATA".equals(line)) {
+                        String fileName = in.readLine();
+                        String sizeStr = in.readLine();
+                        String b64 = (sizeStr != null && Integer.parseInt(sizeStr.trim()) > 0) ? in.readLine() : "";
+                        String end = in.readLine(); // ENDFILE
+                        if (fileName != null && b64 != null && "ENDFILE".equals(end)) {
+                            final String fn = fileName.trim();
+                            final String data = b64.trim();
+                            SwingUtilities.invokeLater(() -> receiveFile(fn, data));
+                        }
                     }
                 }
             } catch (IOException ignored) {
@@ -165,6 +192,122 @@ public class SpriteCalendar extends JFrame {
         updateCalendar();
         updateNetworkStatus();
     }
+
+    private boolean containsFileName(String name) {
+            for (int i = 0; i < sharedFilesModel.size(); i++) {
+                if (sharedFilesModel.get(i).equals(name)) return true;
+            }
+            return false;
+        }
+
+    private Path sharedPath() {
+        Path p = Paths.get(System.getProperty("user.dir"), SHARED_DIR);
+        try { Files.createDirectories(p); } catch (Exception ignored) {}
+        return p;
+    }
+
+    private void refreshLocalSharedList() {
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(sharedPath())) {
+            for (Path f : ds) {
+                if (!Files.isRegularFile(f)) continue;
+                String name = f.getFileName().toString();
+                if (!containsFileName(name)) sharedFilesModel.addElement(name);
+            }
+        } catch (Exception ignored) {}
+    }
+
+
+    private void broadcastFileList() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < sharedFilesModel.size(); i++) {
+            sb.append(sharedFilesModel.get(i)).append("\n");
+        }
+        for (PeerConnection p : peers) {
+            if (!p.alive) continue;
+            p.out.println("FILELIST");
+            p.out.print(sb);
+            p.out.println("END");
+            p.out.flush();
+        }
+    }
+
+    private void requestFileDownload(String fileName) {
+        for (PeerConnection p : peers) {
+            if (!p.alive) continue;
+            p.out.println("GETFILE");
+            p.out.println(fileName);
+            p.out.flush();
+            return; // первый живой пир
+        }
+        JOptionPane.showMessageDialog(this, "Нет подключённых пиров.");
+    }
+
+    /** Вызывается из потока чтения PeerConnection */
+    private void sendFileToPeer(PeerConnection target, String fileName) {
+    Path shared = sharedPath();
+    Path file = shared.resolve(fileName).normalize();
+    if (!file.startsWith(shared) || !Files.isRegularFile(file)) {
+        // сообщаем, что файла нет — пустой FILEDATA с size=0, чтобы клиент не завис
+        target.out.println("FILEDATA");
+        target.out.println(fileName);
+        target.out.println("0");
+        target.out.println("");
+        target.out.println("ENDFILE");
+        target.out.flush();
+        return;
+    }
+    try {
+        byte[] bytes = Files.readAllBytes(file);
+        String b64 = java.util.Base64.getEncoder().encodeToString(bytes);
+        target.out.println("FILEDATA");
+        target.out.println(fileName);
+        target.out.println(bytes.length);
+        target.out.println(b64);
+        target.out.println("ENDFILE");
+        target.out.flush();
+    } catch (Exception e) {
+        System.err.println("Отправка файла: " + e.getMessage());
+    }
+}
+
+
+    private void receiveFile(String fileName, String base64) {
+        try {
+            if (fileName == null || fileName.isEmpty()) return;
+            if (fileName.contains("..") || fileName.contains("/") || fileName.contains("\\")) return;
+            byte[] bytes = base64 == null || base64.isEmpty()
+                    ? new byte[0]
+                    : java.util.Base64.getDecoder().decode(base64);
+            Path dest = sharedPath().resolve(fileName);
+            Files.write(dest, bytes);
+            if (!containsFileName(fileName)) sharedFilesModel.addElement(fileName);
+            JOptionPane.showMessageDialog(SpriteCalendar.this,
+                    "Скачан файл: " + fileName + "\nПапка: " + sharedPath());
+        } catch (Exception e) {
+            JOptionPane.showMessageDialog(SpriteCalendar.this,
+                    "Ошибка приёма файла: " + e.getMessage());
+        }
+    }
+
+
+    private void uploadSharedFile() {
+        JFileChooser ch = new JFileChooser();
+        if (ch.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        Path src = ch.getSelectedFile().toPath();
+        try {
+            Path dest = sharedPath().resolve(src.getFileName().toString());
+            Files.copy(src, dest, StandardCopyOption.REPLACE_EXISTING);
+            String name = dest.getFileName().toString();
+            if (!containsFileName(name)) sharedFilesModel.addElement(name);
+            broadcastFileList();
+            // сразу разослать содержимое
+            for (PeerConnection p : peers) if (p.alive) sendFileToPeer(p, name);
+            JOptionPane.showMessageDialog(this, "Файл добавлен в shared и отправлен пирам.");
+        } catch (Exception e) {
+            JOptionPane.showMessageDialog(this, "Ошибка: " + e.getMessage());
+        }
+    }
+
 
     // ------------------------------------------------------------------
     // Спрайты
@@ -360,6 +503,13 @@ public class SpriteCalendar extends JFrame {
                         peers.add(peer);
                         // сразу отправляем своё состояние новому клиенту
                         peer.sendSync(buildStateText());
+                         // список файлов новому клиенту
+                        peer.out.println("FILELIST");
+                        for (int i = 0; i < sharedFilesModel.size(); i++) {
+                            peer.out.println(sharedFilesModel.get(i));
+                        }
+                        peer.out.println("END");
+                        peer.out.flush();
                         SwingUtilities.invokeLater(this::updateNetworkStatus);
                     } catch (IOException e) {
                         if (networkRunning) e.printStackTrace();
@@ -390,6 +540,10 @@ public class SpriteCalendar extends JFrame {
                 networkRunning = true;
                 // отправляем своё состояние хосту (он тоже может смержить — сейчас просто шлём)
                 peer.sendSync(buildStateText());
+                SwingUtilities.invokeLater(() -> {
+                    refreshLocalSharedList();
+                    broadcastFileList();
+                });
                 SwingUtilities.invokeLater(() -> {
                     updateNetworkStatus();
                     JOptionPane.showMessageDialog(SpriteCalendar.this,
@@ -433,61 +587,112 @@ public class SpriteCalendar extends JFrame {
     }
 
     private void openNetworkMenu() {
-        JDialog d = new JDialog(this, "Сеть — синхронизация", true);
-        d.setSize(420, 280);
+        refreshLocalSharedList();
+
+        JDialog d = new JDialog(this, "Сеть — синхронизация и файлы", true);
+        d.setSize(520, 420);
         d.setLocationRelativeTo(this);
         d.setLayout(new BorderLayout(10, 10));
         d.getContentPane().setBackground(Color.WHITE);
 
-        JPanel form = new JPanel();
-        form.setLayout(new BoxLayout(form, BoxLayout.Y_AXIS));
-        form.setBorder(new EmptyBorder(16, 20, 8, 20));
-        form.setBackground(Color.WHITE);
-
-        JLabel info = new JLabel("<html>Один запускает <b>Хост</b>, остальные вводят его IP и порт.</html>");
-        form.add(info);
-        form.add(Box.createVerticalStrut(12));
+        // ---- Верх: хост / IP / порт ----
+        JPanel top = new JPanel();
+        top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
+        top.setBorder(new EmptyBorder(12, 16, 8, 16));
+        top.setBackground(Color.WHITE);
 
         JPanel portRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         portRow.setOpaque(false);
         portRow.add(new JLabel("Порт:"));
         JTextField portField = new JTextField(String.valueOf(DEFAULT_PORT), 6);
         portRow.add(portField);
-        form.add(portRow);
-        form.add(Box.createVerticalStrut(8));
+        top.add(portRow);
 
         JPanel ipRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
         ipRow.setOpaque(false);
         ipRow.add(new JLabel("IP хоста:"));
         JTextField ipField = new JTextField("127.0.0.1", 14);
         ipRow.add(ipField);
-        form.add(ipRow);
-        form.add(Box.createVerticalStrut(8));
+        top.add(ipRow);
 
         try {
             String localIp = InetAddress.getLocalHost().getHostAddress();
-            JLabel myIp = new JLabel("Твой IP (для друзей): " + localIp);
+            JLabel myIp = new JLabel("Твой IP: " + localIp);
             myIp.setFont(new Font("SansSerif", Font.PLAIN, 12));
-            myIp.setForeground(new Color(60, 60, 60));
-            form.add(myIp);
+            top.add(myIp);
         } catch (Exception ignored) {}
 
-        d.add(form, BorderLayout.CENTER);
+        d.add(top, BorderLayout.NORTH);
 
+        // ---- Центр: список файлов в рамке + кнопка «Скачать» справа ----
+        JPanel center = new JPanel(new BorderLayout(8, 0));
+        center.setBorder(new EmptyBorder(8, 16, 8, 16));
+        center.setBackground(Color.WHITE);
+
+        sharedFilesList = new JList<>(sharedFilesModel);
+        sharedFilesList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        JScrollPane listScroll = new JScrollPane(sharedFilesList);
+        listScroll.setBorder(BorderFactory.createTitledBorder(
+                BorderFactory.createLineBorder(new Color(160, 160, 170)),
+                "Загруженные файлы (папка shared)"));
+        center.add(listScroll, BorderLayout.CENTER);
+
+        JPanel rightBtns = new JPanel();
+        rightBtns.setLayout(new BoxLayout(rightBtns, BoxLayout.Y_AXIS));
+        rightBtns.setBackground(Color.WHITE);
+
+        JButton downloadBtn = new JButton("Скачать");
+        downloadBtn.setAlignmentX(Component.CENTER_ALIGNMENT);
+        downloadBtn.addActionListener(e -> {
+            String name = sharedFilesList.getSelectedValue();
+            if (name == null) {
+                JOptionPane.showMessageDialog(d, "Выбери файл в списке.");
+                return;
+            }
+            // если файл уже есть локально — просто открыть папку / сообщение
+            Path local = sharedPath().resolve(name);
+            if (Files.isRegularFile(local)) {
+                JOptionPane.showMessageDialog(d, "Уже есть локально:\n" + local);
+            } else {
+                requestFileDownload(name);
+            }
+        });
+
+        JButton uploadBtn = new JButton("Загрузить…");
+        uploadBtn.setAlignmentX(Component.CENTER_ALIGNMENT);
+        uploadBtn.addActionListener(e -> uploadSharedFile());
+
+        JButton refreshBtn = new JButton("Обновить");
+        refreshBtn.setAlignmentX(Component.CENTER_ALIGNMENT);
+        refreshBtn.addActionListener(e -> {
+            refreshLocalSharedList();
+            broadcastFileList();
+        });
+
+        rightBtns.add(downloadBtn);
+        rightBtns.add(Box.createVerticalStrut(8));
+        rightBtns.add(uploadBtn);
+        rightBtns.add(Box.createVerticalStrut(8));
+        rightBtns.add(refreshBtn);
+        center.add(rightBtns, BorderLayout.EAST);
+
+        d.add(center, BorderLayout.CENTER);
+
+        // ---- Низ: сеть ----
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 10));
         buttons.setBackground(Color.WHITE);
 
         JButton hostBtn = new JButton("Стать хостом");
         JButton joinBtn = new JButton("Подключиться");
         JButton stopBtn = new JButton("Отключиться");
-        JButton syncBtn = new JButton("Синхронизировать сейчас");
+        JButton syncBtn = new JButton("Синхронизировать календарь");
 
         hostBtn.addActionListener(e -> {
             int port;
             try { port = Integer.parseInt(portField.getText().trim()); }
             catch (Exception ex) { port = DEFAULT_PORT; }
             startHost(port);
-            d.dispose();
+            broadcastFileList();
         });
         joinBtn.addActionListener(e -> {
             int port;
@@ -496,15 +701,12 @@ public class SpriteCalendar extends JFrame {
             String ip = ipField.getText().trim();
             if (ip.isEmpty()) ip = "127.0.0.1";
             joinHost(ip, port);
-            d.dispose();
         });
-        stopBtn.addActionListener(e -> {
-            stopNetwork();
-            d.dispose();
-        });
+        stopBtn.addActionListener(e -> stopNetwork());
         syncBtn.addActionListener(e -> {
             broadcastSync(buildStateText());
-            JOptionPane.showMessageDialog(d, "Состояние отправлено пирам.");
+            broadcastFileList();
+            JOptionPane.showMessageDialog(d, "Календарь и список файлов отправлены.");
         });
 
         buttons.add(hostBtn);
@@ -512,8 +714,10 @@ public class SpriteCalendar extends JFrame {
         buttons.add(syncBtn);
         buttons.add(stopBtn);
         d.add(buttons, BorderLayout.SOUTH);
+
         d.setVisible(true);
     }
+
 
     // ------------------------------------------------------------------
     // UI
