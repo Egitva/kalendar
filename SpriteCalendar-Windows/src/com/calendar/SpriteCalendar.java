@@ -16,15 +16,6 @@ import java.util.*;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-/**
- * Sprite Calendar 1280x720 + P2P синхронизация
- *
- * Кнопка «Сеть» слева сверху — хост / подключение / синхронизация
- * удалённых дней, событий, опросов, типов.
- *
- * Спрайты: см. README
- * Данные: calendar_save.dat
- */
 public class SpriteCalendar extends JFrame {
 
     private static final String SPRITES_PATH = "/sprites/";
